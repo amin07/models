@@ -26,6 +26,10 @@ Example usage:
         --output_dir=/home/user/pet/output
 """
 
+import sys
+import glob
+import os
+
 import hashlib
 import io
 import logging
@@ -38,6 +42,8 @@ from lxml import etree
 import numpy as np
 import PIL.Image
 import tensorflow as tf
+import scipy.io as spio
+from random import shuffle
 
 from object_detection.dataset_tools import tf_record_creation_util
 from object_detection.utils import dataset_util
@@ -45,19 +51,49 @@ from object_detection.utils import label_map_util
 
 flags = tf.app.flags
 flags.DEFINE_string('data_dir', '', 'Root directory to raw pet dataset.')
-flags.DEFINE_string('output_dir', '', 'Path to directory to output TFRecords.')
-flags.DEFINE_string('label_map_path', 'data/pet_label_map.pbtxt',
+flags.DEFINE_string('output_dir', 'training/', 'Path to directory to output TFRecords.')
+flags.DEFINE_string('label_map_path', 'training/egohand_labelmap.pbtxt',
                     'Path to label map proto')
-flags.DEFINE_boolean('faces_only', True, 'If True, generates bounding boxes '
-                     'for pet faces.  Otherwise generates bounding boxes (as '
-                     'well as segmentations for full pet bodies).  Note that '
-                     'in the latter case, the resulting files are much larger.')
 flags.DEFINE_string('mask_type', 'png', 'How to represent instance '
                     'segmentation masks. Options are "png" or "numerical".')
-flags.DEFINE_integer('num_shards', 10, 'Number of TFRecord shards')
 
 FLAGS = flags.FLAGS
 
+
+def loadmat(filename):
+    '''
+    this function should be called instead of direct spio.loadmat
+    as it cures the problem of not properly recovering python dictionaries
+    from mat files. It calls the function check keys to cure all entries
+    which are still mat-objects
+    '''
+    data = spio.loadmat(filename, struct_as_record=False, squeeze_me=True)
+    return _check_keys(data)
+
+def _check_keys(dict):
+    '''
+    checks if entries in dictionary are mat-objects. If yes
+    todict is called to change them to nested dictionaries
+    '''
+    for key in dict:
+        if isinstance(dict[key], spio.matlab.mio5_params.mat_struct):
+            dict[key] = _todict(dict[key])
+    return dict
+
+
+def _todict(matobj):
+
+    '''
+    A recursive function which constructs from matobjects nested dictionaries
+    '''
+    dict = {}
+    for strg in matobj._fieldnames:
+        elem = matobj.__dict__[strg]
+        if isinstance(elem, spio.matlab.mio5_params.mat_struct):
+            dict[strg] = _todict(elem)
+        else:
+            dict[strg] = elem
+    return dict
 
 def get_class_name_from_filename(file_name):
   """Gets the class name from a file.
@@ -72,13 +108,10 @@ def get_class_name_from_filename(file_name):
   match = re.match(r'([A-Za-z_]+)(_[0-9]+\.jpg)', file_name, re.I)
   return match.groups()[0]
 
-
-def dict_to_tf_example(data,
+def data_to_tf_example(img_path,
                        mask_path,
+                       bbox_path,
                        label_map_dict,
-                       image_subdirectory,
-                       ignore_difficult_instances=False,
-                       faces_only=True,
                        mask_type='png'):
   """Convert XML derived dict to tf.Example proto.
 
@@ -105,7 +138,11 @@ def dict_to_tf_example(data,
   Raises:
     ValueError: if the image pointed to by data['filename'] is not a valid JPEG
   """
-  img_path = os.path.join(image_subdirectory, data['filename'])
+
+  #img_path = 'training/images_masks/JENGA_COURTYARD_S_T/frame_0813.jpg'
+  #mask_path = 'training/images_masks/JENGA_COURTYARD_S_T/mask_0813.png'
+  #bbox_path = 'training/images_masks/JENGA_COURTYARD_S_T/bboxes_0813.mat'
+  
   with tf.gfile.GFile(img_path, 'rb') as fid:
     encoded_jpg = fid.read()
   encoded_jpg_io = io.BytesIO(encoded_jpg)
@@ -121,14 +158,11 @@ def dict_to_tf_example(data,
   if mask.format != 'PNG':
     raise ValueError('Mask format not PNG')
 
+  bboxes = loadmat(bbox_path)['bboxes']
   mask_np = np.asarray(mask)
-  nonbackground_indices_x = np.any(mask_np != 2, axis=0)
-  nonbackground_indices_y = np.any(mask_np != 2, axis=1)
-  nonzero_x_indices = np.where(nonbackground_indices_x)
-  nonzero_y_indices = np.where(nonbackground_indices_y)
 
-  width = int(data['size']['width'])
-  height = int(data['size']['height'])
+  width = mask.size[0]
+  height = mask.size[1]
 
   xmins = []
   ymins = []
@@ -136,48 +170,39 @@ def dict_to_tf_example(data,
   ymaxs = []
   classes = []
   classes_text = []
-  truncated = []
-  poses = []
-  difficult_obj = []
   masks = []
-  if 'object' in data:
-    for obj in data['object']:
-      difficult = bool(int(obj['difficult']))
-      if ignore_difficult_instances and difficult:
+  
+  #mask.show()
+  for b in range(bboxes.shape[0]):
+      if np.all(bboxes[b]==0):
         continue
-      difficult_obj.append(int(difficult))
+      
+      xst, yst = bboxes[b][0], bboxes[b][1]             # x is along width, y is along height
+      yed, xed = yst + bboxes[b][3], xst + bboxes[b][2] # possible mistake in matlab code
 
-      if faces_only:
-        xmin = float(obj['bndbox']['xmin'])
-        xmax = float(obj['bndbox']['xmax'])
-        ymin = float(obj['bndbox']['ymin'])
-        ymax = float(obj['bndbox']['ymax'])
-      else:
-        xmin = float(np.min(nonzero_x_indices))
-        xmax = float(np.max(nonzero_x_indices))
-        ymin = float(np.min(nonzero_y_indices))
-        ymax = float(np.max(nonzero_y_indices))
+      curr_mask = mask.copy()
+      pixel_map = curr_mask.load()
+      for r in range(curr_mask.size[0]):    #width
+        for c in range(curr_mask.size[1]):    #height
+          if r<xst or r>=xed or c<yst or c>=yed:
+            pixel_map[r, c] = (0)
+      #curr_mask.show()
+      output = io.BytesIO()
+      curr_mask.save(output, format='PNG')
+      masks.append(output.getvalue())
+      ymins.append(yst/height)
+      xmins.append(xst/width)
+      ymaxs.append(yed/height)
+      xmaxs.append(xed/width)
+      classes.append(1)
+      classes_text.append('hand'.encode('utf8'))
 
-      xmins.append(xmin / width)
-      ymins.append(ymin / height)
-      xmaxs.append(xmax / width)
-      ymaxs.append(ymax / height)
-      class_name = get_class_name_from_filename(data['filename'])
-      classes_text.append(class_name.encode('utf8'))
-      classes.append(label_map_dict[class_name])
-      truncated.append(int(obj['truncated']))
-      poses.append(obj['pose'].encode('utf8'))
-      if not faces_only:
-        mask_remapped = (mask_np != 2).astype(np.uint8)
-        masks.append(mask_remapped)
 
   feature_dict = {
       'image/height': dataset_util.int64_feature(height),
       'image/width': dataset_util.int64_feature(width),
-      'image/filename': dataset_util.bytes_feature(
-          data['filename'].encode('utf8')),
-      'image/source_id': dataset_util.bytes_feature(
-          data['filename'].encode('utf8')),
+      'image/filename': dataset_util.bytes_feature(img_path.encode('utf8')),
+      'image/source_id': dataset_util.bytes_feature(img_path.encode('utf8')),
       'image/key/sha256': dataset_util.bytes_feature(key.encode('utf8')),
       'image/encoded': dataset_util.bytes_feature(encoded_jpg),
       'image/format': dataset_util.bytes_feature('jpeg'.encode('utf8')),
@@ -187,10 +212,9 @@ def dict_to_tf_example(data,
       'image/object/bbox/ymax': dataset_util.float_list_feature(ymaxs),
       'image/object/class/text': dataset_util.bytes_list_feature(classes_text),
       'image/object/class/label': dataset_util.int64_list_feature(classes),
-      'image/object/difficult': dataset_util.int64_list_feature(difficult_obj),
-      'image/object/truncated': dataset_util.int64_list_feature(truncated),
-      'image/object/view': dataset_util.bytes_list_feature(poses),
+      'image/object/mask' : dataset_util.bytes_list_feature(masks)
   }
+  '''
   if not faces_only:
     if mask_type == 'numerical':
       mask_stack = np.stack(masks).astype(np.float32)
@@ -204,21 +228,12 @@ def dict_to_tf_example(data,
         output = io.BytesIO()
         img.save(output, format='PNG')
         encoded_mask_png_list.append(output.getvalue())
-      feature_dict['image/object/mask'] = (
-          dataset_util.bytes_list_feature(encoded_mask_png_list))
-
+  '''
   example = tf.train.Example(features=tf.train.Features(feature=feature_dict))
   return example
 
 
-def create_tf_record(output_filename,
-                     num_shards,
-                     label_map_dict,
-                     annotations_dir,
-                     image_dir,
-                     examples,
-                     faces_only=True,
-                     mask_type='png'):
+def create_tf_record(data_dir, output_filename, label_map_dict, mask_type='png'):
   """Creates a TFRecord file from examples.
 
   Args:
@@ -233,6 +248,22 @@ def create_tf_record(output_filename,
     mask_type: 'numerical' or 'png'. 'png' is recommended because it leads to
       smaller file sizes.
   """
+  writer = tf.python_io.TFRecordWriter(output_filename)
+  dir_names = glob.glob(data_dir+'/*')
+  write_cnt = 0
+  for dr in dir_names:
+    im_files = glob.glob(dr+'/*.jpg')
+    shuffle(im_files)
+    for im_file in im_files:
+      frame_no = os.path.basename(im_file).split('.')[0].split('_')[-1] 
+      mask_file = os.path.join(os.path.dirname(im_file), 'mask_'+frame_no+'.png')
+      bbox_file = os.path.join(os.path.dirname(im_file), 'bboxes_'+frame_no+'.mat')
+      print (im_file, mask_file, bbox_file)
+      example = data_to_tf_example(im_file, mask_file, bbox_file, label_map_dict) 
+      writer.write(example.SerializeToString())
+      print (write_cnt + 1, 'written file', im_file)
+  writer.close()
+  '''
   with contextlib2.ExitStack() as tf_record_close_stack:
     output_tfrecords = tf_record_creation_util.open_sharded_output_tfrecords(
         tf_record_close_stack, output_filename, num_shards)
@@ -263,54 +294,21 @@ def create_tf_record(output_filename,
           output_tfrecords[shard_idx].write(tf_example.SerializeToString())
       except ValueError:
         logging.warning('Invalid example: %s, ignoring.', xml_path)
-
+  '''
 
 # TODO(derekjchow): Add test for pet/PASCAL main files.
 def main(_):
   data_dir = FLAGS.data_dir
   label_map_dict = label_map_util.get_label_map_dict(FLAGS.label_map_path)
+  print (label_map_dict)
+  logging.info('Reading from hand dataset.')
 
-  logging.info('Reading from Pet dataset.')
-  image_dir = os.path.join(data_dir, 'images')
-  annotations_dir = os.path.join(data_dir, 'annotations')
-  examples_path = os.path.join(annotations_dir, 'trainval.txt')
-  examples_list = dataset_util.read_examples_list(examples_path)
 
-  # Test images are not included in the downloaded data set, so we shall perform
-  # our own split.
-  random.seed(42)
-  random.shuffle(examples_list)
-  num_examples = len(examples_list)
-  num_train = int(0.7 * num_examples)
-  train_examples = examples_list[:num_train]
-  val_examples = examples_list[num_train:]
-  logging.info('%d training and %d validation examples.',
-               len(train_examples), len(val_examples))
-
-  train_output_path = os.path.join(FLAGS.output_dir, 'pet_faces_train.record')
-  val_output_path = os.path.join(FLAGS.output_dir, 'pet_faces_val.record')
-  if not FLAGS.faces_only:
-    train_output_path = os.path.join(FLAGS.output_dir,
-                                     'pets_fullbody_with_masks_train.record')
-    val_output_path = os.path.join(FLAGS.output_dir,
-                                   'pets_fullbody_with_masks_val.record')
+  train_output_path = os.path.join(FLAGS.output_dir, 'egohand_train.record')
   create_tf_record(
+      data_dir,
       train_output_path,
-      FLAGS.num_shards,
       label_map_dict,
-      annotations_dir,
-      image_dir,
-      train_examples,
-      faces_only=FLAGS.faces_only,
-      mask_type=FLAGS.mask_type)
-  create_tf_record(
-      val_output_path,
-      FLAGS.num_shards,
-      label_map_dict,
-      annotations_dir,
-      image_dir,
-      val_examples,
-      faces_only=FLAGS.faces_only,
       mask_type=FLAGS.mask_type)
 
 
