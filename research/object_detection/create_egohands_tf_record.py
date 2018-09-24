@@ -13,12 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 
-r"""Convert the Oxford pet dataset to TFRecord for object_detection.
-
-See: O. M. Parkhi, A. Vedaldi, A. Zisserman, C. V. Jawahar
-     Cats and Dogs
-     IEEE Conference on Computer Vision and Pattern Recognition, 2012
-     http://www.robots.ox.ac.uk/~vgg/data/pets/
+r"""Convert custom dataset to tfrecord with segmentation masks.
 
 Example usage:
     python object_detection/dataset_tools/create_pet_tf_record.py \
@@ -119,16 +114,9 @@ def data_to_tf_example(img_path,
   by the raw data.
 
   Args:
-    data: dict holding PASCAL XML fields for a single image (obtained by
-      running dataset_util.recursive_parse_xml_to_dict)
+    img_path: location to rgb image
     mask_path: String path to PNG encoded mask.
     label_map_dict: A map from string label names to integers ids.
-    image_subdirectory: String specifying subdirectory within the
-      Pascal dataset directory holding the actual image data.
-    ignore_difficult_instances: Whether to skip difficult instances in the
-      dataset  (default: False).
-    faces_only: If True, generates bounding boxes for pet faces.  Otherwise
-      generates bounding boxes (as well as segmentations for full pet bodies).
     mask_type: 'numerical' or 'png'. 'png' is recommended because it leads to
       smaller file sizes.
 
@@ -214,21 +202,6 @@ def data_to_tf_example(img_path,
       'image/object/class/label': dataset_util.int64_list_feature(classes),
       'image/object/mask' : dataset_util.bytes_list_feature(masks)
   }
-  '''
-  if not faces_only:
-    if mask_type == 'numerical':
-      mask_stack = np.stack(masks).astype(np.float32)
-      masks_flattened = np.reshape(mask_stack, [-1])
-      feature_dict['image/object/mask'] = (
-          dataset_util.float_list_feature(masks_flattened.tolist()))
-    elif mask_type == 'png':
-      encoded_mask_png_list = []
-      for mask in masks:
-        img = PIL.Image.fromarray(mask)
-        output = io.BytesIO()
-        img.save(output, format='PNG')
-        encoded_mask_png_list.append(output.getvalue())
-  '''
   example = tf.train.Example(features=tf.train.Features(feature=feature_dict))
   return example
 
@@ -238,13 +211,8 @@ def create_tf_record(data_dir, output_filename, label_map_dict, mask_type='png')
 
   Args:
     output_filename: Path to where output file is saved.
-    num_shards: Number of shards for output file.
     label_map_dict: The label map dictionary.
-    annotations_dir: Directory where annotation files are stored.
-    image_dir: Directory where image files are stored.
-    examples: Examples to parse and save to tf record.
-    faces_only: If True, generates bounding boxes for pet faces.  Otherwise
-      generates bounding boxes (as well as segmentations for full pet bodies).
+    data_dir: Directory where image files are stored.
     mask_type: 'numerical' or 'png'. 'png' is recommended because it leads to
       smaller file sizes.
   """
