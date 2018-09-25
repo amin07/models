@@ -165,8 +165,8 @@ def data_to_tf_example(img_path,
       if np.all(bboxes[b]==0):
         continue
       
-      xst, yst = bboxes[b][0], bboxes[b][1]             # x is along width, y is along height
-      yed, xed = yst + bboxes[b][3], xst + bboxes[b][2] # possible mistake in matlab code
+      xst, yst = bboxes[b][0]-1, bboxes[b][1]-1             # x is along width, y is along height, python 0 based - matlab 1
+      yed, xed = yst + bboxes[b][3], xst + bboxes[b][2]     # possible mistake in matlab code
 
       curr_mask = mask.copy()
       pixel_map = curr_mask.load()
@@ -230,6 +230,7 @@ def create_tf_record(data_dir, output_filename, label_map_dict, mask_type='png')
       example = data_to_tf_example(im_file, mask_file, bbox_file, label_map_dict) 
       writer.write(example.SerializeToString())
       print (write_cnt + 1, 'written file', im_file)
+      write_cnt += 1
   writer.close()
   '''
   with contextlib2.ExitStack() as tf_record_close_stack:
@@ -272,7 +273,7 @@ def main(_):
   logging.info('Reading from hand dataset.')
 
 
-  train_output_path = os.path.join(FLAGS.output_dir, 'egohand_train.record')
+  train_output_path = os.path.join(FLAGS.output_dir, 'egohand_train_bbox_0idx.record')
   create_tf_record(
       data_dir,
       train_output_path,
